@@ -1059,6 +1059,56 @@ def handle_event():
 
 
 # ============ TELEGRAM PLAYABLE VIDEO HELPERS ============
+def mp4_has_audio(file_path):
+    """Return True if MP4 has at least one audio stream. Silent MP4s can appear as GIFs in Telegram."""
+    try:
+        ffprobe = media_converter.get_ffprobe_path() if hasattr(media_converter, 'get_ffprobe_path') else 'ffprobe'
+        cmd = [
+            ffprobe, '-v', 'error', '-select_streams', 'a:0',
+            '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', file_path
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        return res.returncode == 0 and 'audio' in (res.stdout or '').lower()
+    except Exception as e:
+        print(f"⚠️ Audio probe failed: {e}")
+        return False
+
+def ensure_mp4_has_audio(mp4_path):
+    """Add a silent AAC track when needed so Telegram treats the file as a normal video, not GIF/animation."""
+    try:
+        if not mp4_path.lower().endswith('.mp4') or not os.path.exists(mp4_path):
+            return False
+        if mp4_has_audio(mp4_path):
+            return True
+
+        print(f"🔇 No audio track detected — adding silent AAC track to prevent Telegram GIF mode: {os.path.basename(mp4_path)}")
+        ffmpeg = media_converter.get_ffmpeg_path() if hasattr(media_converter, 'get_ffmpeg_path') else 'ffmpeg'
+        base, ext = os.path.splitext(mp4_path)
+        fixed_path = base + '.withaudio' + ext
+        cmd = [
+            ffmpeg, '-y',
+            '-i', mp4_path,
+            '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+            '-map', '0:v:0', '-map', '1:a:0',
+            '-c:v', 'copy',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-shortest', '-movflags', '+faststart',
+            fixed_path
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if res.returncode == 0 and os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 0:
+            os.replace(fixed_path, mp4_path)
+            print("✅ Silent AAC track added; Telegram will show as normal playable video.")
+            return True
+        print(f"⚠️ Silent audio add failed: {res.stderr[:300]}")
+        try:
+            if os.path.exists(fixed_path): os.remove(fixed_path)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"⚠️ ensure_mp4_has_audio failed: {e}")
+    return mp4_has_audio(mp4_path)
+
 def get_video_metadata(file_path):
     """Return duration/width/height for Telegram native player."""
     meta = {"duration": 0, "width": 0, "height": 0}
@@ -1227,18 +1277,20 @@ def _bg_process_recording(webm_path, room_id, seg_num, is_last, timestamp, webm_
 
         update_recording_job(job_id, "Worker started — preparing media", 8, "processing", force=True)
 
-        # ---- If the browser already sent a playable MP4 (Safari/iOS), skip conversion ----
-        is_already_mp4 = webm_path.lower().endswith('.mp4')
-        if is_already_mp4:
-            mp4_path = webm_path
-            mp4_success = True
-            print(f"🎬 Input already MP4 — skipping conversion: {os.path.basename(webm_path)}")
-            update_recording_job(job_id, "Input already MP4 — validating for Telegram", 45, "processing", force=True)
-        else:
-            mp4_path = webm_path.replace('.webm', '.mp4')
-            update_recording_job(job_id, "FFmpeg converting WebM → MP4", 25, "processing", force=True)
-            mp4_success = convert_webm_to_mp4(webm_path, mp4_path)
-            update_recording_job(job_id, "MP4 conversion completed" if mp4_success else "MP4 conversion failed", 58 if mp4_success else 100, "processing" if mp4_success else "failed", force=True)
+        # ---- Always normalize browser recording into Telegram-ready MP4 ----
+        # Some browsers send MP4 directly, but Telegram may show silent/unoptimized MP4 as GIF.
+        # So even MP4 inputs are re-normalized and checked for an AAC audio track.
+        base_path, input_ext = os.path.splitext(webm_path)
+        mp4_path = base_path + ('.telegram.mp4' if input_ext.lower() == '.mp4' else '.mp4')
+        update_recording_job(job_id, "FFmpeg normalizing recording → Telegram MP4", 25, "processing", force=True)
+        mp4_success = convert_webm_to_mp4(webm_path, mp4_path)
+        update_recording_job(job_id, "MP4 conversion completed" if mp4_success else "MP4 conversion failed", 58 if mp4_success else 100, "processing" if mp4_success else "failed", force=True)
+
+        if mp4_success:
+            update_recording_job(job_id, "Checking AAC audio track", 68, "processing")
+            if not ensure_mp4_has_audio(mp4_path):
+                mp4_success = False
+                update_recording_job(job_id, "MP4 audio track fix failed", 100, "failed", error="Could not add AAC audio track", force=True)
 
         # ---- Extract MP3 from video ----
         _base, _ = os.path.splitext(webm_path)
