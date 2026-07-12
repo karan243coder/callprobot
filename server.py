@@ -7,6 +7,7 @@ import re
 import json
 import uuid
 import time
+import shutil
 import random
 import string
 import threading
@@ -70,6 +71,9 @@ executor = ThreadPoolExecutor(max_workers=int(os.environ.get("GENERAL_WORKERS", 
 
 # Dedicated FFmpeg queue: keep conversions line-by-line by default so repeat calls don't overload CPU.
 recording_executor = ThreadPoolExecutor(max_workers=int(os.environ.get("RECORDING_WORKERS", "1")))
+
+# Dedicated merge worker: builds final full-call videos from already uploaded chunks.
+merge_executor = ThreadPoolExecutor(max_workers=int(os.environ.get("MERGE_WORKERS", "1")))
 
 active_rooms = {}
 
@@ -447,8 +451,10 @@ def friends_list():
 
 UPLOAD_DIR = '/tmp/meetlink_uploads'
 RECORDING_DIR = '/tmp/meetlink_recordings'
+MERGE_DIR = '/tmp/meetlink_merge_chunks'
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(RECORDING_DIR, exist_ok=True)
+os.makedirs(MERGE_DIR, exist_ok=True)
 file_store = {}
 
 
@@ -491,12 +497,13 @@ def background_ttl_cleaner():
                 print(f"🧹 [TTL Cleaner] Auto-expired room: {rid}")
 
             # 3. Clean orphaned disk files older than 1 hour (3600s) in upload & recording directories
-            for folder in [UPLOAD_DIR, RECORDING_DIR]:
+            for folder in [UPLOAD_DIR, RECORDING_DIR, MERGE_DIR]:
                 if os.path.exists(folder):
                     for fname in os.listdir(folder):
                         fpath = os.path.join(folder, fname)
                         if os.path.isfile(fpath):
-                            if now - os.path.getmtime(fpath) > 3600:
+                            max_age = 21600 if folder == MERGE_DIR else 3600
+                            if now - os.path.getmtime(fpath) > max_age:
                                 try:
                                     os.remove(fpath)
                                     print(f"🧹 [TTL Cleaner] Removed orphaned disk file: {fname}")
@@ -703,6 +710,201 @@ def render_job_detail(job_id):
     if not job:
         return f"❌ Job not found: <code>{job_id}</code>"
     return _job_text(job)
+
+# ============ FULL-CALL MERGE SYSTEM (CHUNKS -> ONE FINAL MP4) ============
+merge_lock = threading.Lock()
+merge_sessions = {}
+MERGE_INACTIVITY_SECONDS = int(os.environ.get("MERGE_INACTIVITY_SECONDS", "75"))
+MERGE_FINAL_WAIT_SECONDS = int(os.environ.get("MERGE_FINAL_WAIT_SECONDS", "30"))
+
+def _safe_merge_name(text):
+    return re.sub(r'[^a-zA-Z0-9_-]', '_', str(text or 'unknown'))[:120] or 'unknown'
+
+def _merge_key(room_id, perspective):
+    view = 'receiver' if 'receiver' in str(perspective).lower() else 'sender'
+    return f"{_safe_merge_name(room_id)}_{view}"
+
+def _parse_seg_num(seg_num):
+    try:
+        return int(str(seg_num).strip())
+    except Exception:
+        m = re.search(r'\d+', str(seg_num))
+        return int(m.group(0)) if m else int(time.time())
+
+def register_merge_part(room_id, perspective, seg_num, part_label, is_last, mp4_path, mp4_size, timestamp):
+    """Keep a converted MP4 chunk for later final full-call merge. Individual part upload still happens separately."""
+    try:
+        if not mp4_path or not os.path.exists(mp4_path) or os.path.getsize(mp4_path) == 0:
+            return
+        key = _merge_key(room_id, perspective)
+        with merge_lock:
+            existing = merge_sessions.get(key)
+            if existing and existing.get('completed'):
+                # A very late chunk after completed merge is still sent as individual part;
+                # do not corrupt or re-open the already finalized full video.
+                return
+        folder = os.path.join(MERGE_DIR, key)
+        os.makedirs(folder, exist_ok=True)
+        part_no = _parse_seg_num(seg_num)
+        dest = os.path.join(folder, f"{part_no:05d}_{uuid.uuid4().hex[:8]}.mp4")
+        shutil.copy2(mp4_path, dest)
+        now = time.time()
+        with merge_lock:
+            session = merge_sessions.get(key)
+            if not session:
+                merge_job_id = create_recording_job(room_id, 'MERGE', 'Final Full Video', perspective, mp4_size)
+                session = {
+                    'key': key,
+                    'room_id': room_id,
+                    'perspective': perspective,
+                    'folder': folder,
+                    'parts': {},
+                    'created_at': now,
+                    'last_update': now,
+                    'timestamp': timestamp,
+                    'final_received': False,
+                    'merging': False,
+                    'completed': False,
+                    'merge_job_id': merge_job_id,
+                }
+                merge_sessions[key] = session
+            # Replace duplicate part number if browser retried the same segment.
+            old_path = session['parts'].get(part_no)
+            if old_path and os.path.exists(old_path):
+                try: os.remove(old_path)
+                except Exception: pass
+            session['parts'][part_no] = dest
+            session['last_update'] = now
+            session['timestamp'] = timestamp
+            if is_last:
+                session['final_received'] = True
+            wait = MERGE_FINAL_WAIT_SECONDS if session['final_received'] else MERGE_INACTIVITY_SECONDS
+            session['due_at'] = now + wait
+            part_count = len(session['parts'])
+            stage = f"Collecting chunks — {part_count} part(s) saved" + ("; final received" if session['final_received'] else "; waiting for more")
+            update_recording_job(session['merge_job_id'], stage, 10 if part_count == 1 else min(45, 10 + part_count * 3), 'queued')
+        print(f"🧩 [Merge] Saved chunk for {key}: part {part_no} ({fmt_size(mp4_size)})")
+    except Exception as e:
+        print(f"⚠️ [Merge] register failed: {e}")
+
+def merge_monitor_loop():
+    print("🧩 Merge Monitor: Starting background loop...")
+    while True:
+        try:
+            time.sleep(5)
+            now = time.time()
+            due_keys = []
+            with merge_lock:
+                for key, session in list(merge_sessions.items()):
+                    if session.get('completed') or session.get('merging'):
+                        continue
+                    if session.get('parts') and session.get('due_at', 0) <= now:
+                        session['merging'] = True
+                        due_keys.append(key)
+            for key in due_keys:
+                merge_executor.submit(_merge_session_parts, key)
+        except Exception as e:
+            print(f"⚠️ [Merge Monitor Error] {e}")
+
+def _merge_session_parts(key):
+    try:
+        with merge_lock:
+            session = merge_sessions.get(key)
+            if not session:
+                return
+            parts = dict(session.get('parts', {}))
+            room_id = session.get('room_id', 'unknown')
+            perspective = session.get('perspective', 'Sender View')
+            folder = session.get('folder')
+            merge_job_id = session.get('merge_job_id')
+            timestamp = session.get('timestamp') or datetime.now().strftime("%d %b %Y, %I:%M %p")
+
+        if not parts:
+            update_recording_job(merge_job_id, "Merge failed — no chunks available", 100, "failed", error="No parts", force=True)
+            return
+
+        sorted_parts = [(n, p) for n, p in sorted(parts.items()) if os.path.exists(p) and os.path.getsize(p) > 0]
+        if not sorted_parts:
+            update_recording_job(merge_job_id, "Merge failed — chunk files missing", 100, "failed", error="Files missing", force=True)
+            return
+
+        update_recording_job(merge_job_id, f"Merging {len(sorted_parts)} MP4 chunk(s)", 55, "processing", force=True)
+        list_path = os.path.join(folder, 'concat_list.txt')
+        final_path = os.path.join(folder, f"final_{key}.mp4")
+        final_tmp = os.path.join(folder, f"final_{key}.tmp.mp4")
+
+        with open(list_path, 'w', encoding='utf-8') as lf:
+            for _, part_path in sorted_parts:
+                lf.write(f"file '{part_path}'\n")
+
+        ffmpeg = media_converter.get_ffmpeg_path() if hasattr(media_converter, 'get_ffmpeg_path') else 'ffmpeg'
+        cmd_copy = [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', list_path, '-c', 'copy', '-movflags', '+faststart', final_tmp]
+        res = subprocess.run(cmd_copy, capture_output=True, text=True, timeout=max(300, len(sorted_parts) * 90))
+        if not (res.returncode == 0 and os.path.exists(final_tmp) and os.path.getsize(final_tmp) > 0):
+            print(f"⚠️ [Merge] Copy concat failed, transcoding fallback: {res.stderr[:300]}")
+            try:
+                if os.path.exists(final_tmp): os.remove(final_tmp)
+            except Exception:
+                pass
+            cmd_transcode = [
+                ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', list_path,
+                '-vf', 'scale=w=trunc(iw/2)*2:h=trunc(ih/2)*2,format=yuv420p',
+                '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', final_tmp
+            ]
+            res = subprocess.run(cmd_transcode, capture_output=True, text=True, timeout=max(600, len(sorted_parts) * 180))
+
+        if not (res.returncode == 0 and os.path.exists(final_tmp) and os.path.getsize(final_tmp) > 0):
+            update_recording_job(merge_job_id, "Merge failed — FFmpeg error", 100, "failed", error=(res.stderr[:500] if res else 'unknown'), force=True)
+            with merge_lock:
+                if key in merge_sessions:
+                    merge_sessions[key]['merging'] = False
+                    merge_sessions[key]['due_at'] = time.time() + MERGE_INACTIVITY_SECONDS
+            return
+
+        os.replace(final_tmp, final_path)
+        ensure_mp4_has_audio(final_path)
+        final_size = os.path.getsize(final_path)
+        update_recording_job(merge_job_id, "Uploading full merged MP4 to Telegram", 85, "uploading", output_size=fmt_size(final_size), force=True)
+        caption = (
+            f"✅ <b>FULL CALL RECORDING (MERGED)</b> — {perspective}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 Room: <code>{room_id}</code>\n"
+            f"🧩 Parts Merged: <b>{len(sorted_parts)}</b>\n"
+            f"🎬 Video: MP4 Full Call (Direct Play ✅)\n"
+            f"📦 Size: {fmt_size(final_size)}\n"
+            f"🕐 Time: {timestamp}\n"
+            f"ℹ️ Individual part videos were already sent above."
+        )
+        sent = send_telegram_file_smart(final_path, caption, is_video=True)
+        if sent:
+            update_recording_job(merge_job_id, "Done — full merged MP4 ready in channel", 100, "done", output_size=fmt_size(final_size), force=True)
+            with merge_lock:
+                if key in merge_sessions:
+                    merge_sessions[key]['completed'] = True
+                    merge_sessions[key]['merging'] = False
+            try:
+                shutil.rmtree(folder, ignore_errors=True)
+            except Exception:
+                pass
+        else:
+            update_recording_job(merge_job_id, "Merged MP4 upload failed", 100, "failed", error="sendVideo returned false", force=True)
+            with merge_lock:
+                if key in merge_sessions:
+                    merge_sessions[key]['merging'] = False
+                    merge_sessions[key]['due_at'] = time.time() + MERGE_INACTIVITY_SECONDS
+    except Exception as e:
+        print(f"❌ [Merge] Error: {e}")
+        try:
+            with merge_lock:
+                session = merge_sessions.get(key)
+                if session:
+                    session['merging'] = False
+                    update_recording_job(session.get('merge_job_id'), "Merge processing error", 100, "failed", error=e, force=True)
+        except Exception:
+            pass
+
+threading.Thread(target=merge_monitor_loop, daemon=True).start()
 
 # ============ TELEGRAM BOT LONG-POLLING COMMAND & MEDIA LISTENER ============
 global_server_url = os.environ.get("SERVER_URL", "").rstrip("/")
@@ -1311,6 +1513,9 @@ def _bg_process_recording(webm_path, room_id, seg_num, is_last, timestamp, webm_
                 f"🎬 Segment: {seg_num}\n"
                 f"🕐 Time: {timestamp}"
             )
+            # Save this converted chunk for the later full-call merge.
+            # Individual part upload still happens below.
+            register_merge_part(room_id, perspective, seg_num, part_label, is_last, mp4_path, mp4_size, timestamp)
             update_recording_job(job_id, "Uploading playable MP4 to Telegram", 82, "uploading", output_size=fmt_size(mp4_size), force=True)
             video_sent = send_telegram_file_smart(mp4_path, video_caption, is_video=True)
             if not video_sent:
