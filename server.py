@@ -40,6 +40,14 @@ API_HASH = os.environ.get("API_HASH", _API_HASH or "")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
 PROGRESS_CHAT_IDS_ENV = os.environ.get("PROGRESS_CHAT_IDS", "").strip()
 
+# Telegram anti-flood safety. Increase if channel has many parts/users.
+TELEGRAM_MEDIA_MIN_INTERVAL = float(os.environ.get("TELEGRAM_MEDIA_MIN_INTERVAL", "7"))
+PROGRESS_EDIT_INTERVAL_ENV = float(os.environ.get("PROGRESS_EDIT_INTERVAL", "20"))
+telegram_media_lock = threading.Lock()
+telegram_media_last_sent_at = 0.0
+telegram_api_lock = threading.Lock()
+telegram_api_silence_until = 0.0
+
 pyro_client = None
 def start_pyrogram_engine():
     global pyro_client
@@ -518,13 +526,14 @@ threading.Thread(target=background_ttl_cleaner, daemon=True).start()
 # ============ RECORDING JOB PROGRESS SYSTEM (BOT + CHANNEL) ============
 progress_lock = threading.Lock()
 recording_jobs = {}
+progress_retry_jobs = set()
 progress_subscribers = set()
 for _cid in [ADMIN_CHAT_ID] + [x.strip() for x in PROGRESS_CHAT_IDS_ENV.split(',') if x.strip()]:
     if _cid:
         progress_subscribers.add(str(_cid))
 
 MAX_PROGRESS_JOBS = 80
-PROGRESS_EDIT_INTERVAL = 4.0  # seconds; prevents Telegram flood/lag
+PROGRESS_EDIT_INTERVAL = PROGRESS_EDIT_INTERVAL_ENV  # seconds; prevents Telegram flood/lag
 
 def _is_valid_progress_target(chat_id):
     return bool(chat_id and str(chat_id).strip() and str(chat_id).strip() not in ("@YOUR_CHANNEL_USERNAME", "YOUR_CHANNEL_USERNAME"))
@@ -538,13 +547,32 @@ def _progress_bar(percent, width=10):
     return "█" * filled + "░" * (width - filled)
 
 def _tg_api(method, payload, timeout=8):
+    global telegram_api_silence_until
     try:
         if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or not BOT_TOKEN:
             return None
+        now = time.time()
+        with telegram_api_lock:
+            if now < telegram_api_silence_until:
+                # Telegram asked us to slow down; skip non-critical progress updates.
+                return None
         resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload, timeout=timeout)
         if resp.status_code == 200:
             return resp.json()
-        print(f"⚠️ Telegram API {method} failed: {resp.status_code} {resp.text[:250]}")
+        body = resp.text or ""
+        if resp.status_code == 400 and "message is not modified" in body.lower():
+            return {"ok": True, "not_modified": True}
+        if resp.status_code == 429:
+            retry_after = 10
+            try:
+                retry_after = int(resp.json().get("parameters", {}).get("retry_after", retry_after))
+            except Exception:
+                pass
+            with telegram_api_lock:
+                telegram_api_silence_until = time.time() + retry_after + 1
+            print(f"⚠️ Telegram API {method} flood wait: sleeping progress updates for {retry_after}s")
+            return None
+        print(f"⚠️ Telegram API {method} failed: {resp.status_code} {body[:250]}")
     except Exception as e:
         print(f"⚠️ Telegram API {method} exception: {e}")
     return None
@@ -630,6 +658,7 @@ def create_recording_job(room_id, seg_num, part_label, perspective, raw_size):
         "created_at": now,
         "updated_at": now,
         "message_ids": {},
+        "last_texts": {},
         "last_edit_at": 0,
     }
     with progress_lock:
@@ -661,6 +690,7 @@ def update_recording_job(job_id, stage=None, progress=None, status=None, output_
         job["updated_at"] = time.time()
         now = job["updated_at"]
         if not force and now - job.get("last_edit_at", 0) < PROGRESS_EDIT_INTERVAL:
+            progress_retry_jobs.add(job_id)
             return
         job["last_edit_at"] = now
     executor.submit(publish_recording_progress, job_id, force)
@@ -669,24 +699,64 @@ def publish_recording_progress(job_id, force=False):
     with progress_lock:
         job = recording_jobs.get(job_id)
         if not job:
+            progress_retry_jobs.discard(job_id)
             return
         text = _job_text(job)
         known_messages = dict(job.get("message_ids", {}))
-    changed = {}
+        last_texts = dict(job.get("last_texts", {}))
+    changed_messages = {}
+    changed_texts = {}
+    failed_any = False
     for target in _progress_targets(include_channel=True):
-        msg_id = known_messages.get(str(target))
-        ok = False
+        target = str(target)
+        msg_id = known_messages.get(target)
         if msg_id:
+            if last_texts.get(target) == text:
+                continue
             ok = _edit_progress_message(target, msg_id, text)
-        if not ok:
+            if ok:
+                changed_texts[target] = text
+            else:
+                # Do NOT send a duplicate status message if edit failed due flood/network.
+                failed_any = True
+        else:
             msg_id = _send_progress_message(target, text)
-        if msg_id:
-            changed[str(target)] = msg_id
-    if changed:
-        with progress_lock:
-            job = recording_jobs.get(job_id)
-            if job:
-                job.setdefault("message_ids", {}).update(changed)
+            if msg_id:
+                changed_messages[target] = msg_id
+                changed_texts[target] = text
+            else:
+                failed_any = True
+    with progress_lock:
+        job = recording_jobs.get(job_id)
+        if job:
+            if changed_messages:
+                job.setdefault("message_ids", {}).update(changed_messages)
+            if changed_texts:
+                job.setdefault("last_texts", {}).update(changed_texts)
+            if failed_any:
+                progress_retry_jobs.add(job_id)
+            else:
+                progress_retry_jobs.discard(job_id)
+
+def progress_retry_loop():
+    """Retries skipped progress updates after Telegram flood-wait/silence expires."""
+    print("📊 Progress Retry Loop: Starting background loop...")
+    while True:
+        try:
+            time.sleep(8)
+            with telegram_api_lock:
+                silenced = time.time() < telegram_api_silence_until
+            if silenced:
+                continue
+            with progress_lock:
+                retry_ids = list(progress_retry_jobs)[:20]
+                progress_retry_jobs.difference_update(retry_ids)
+            for jid in retry_ids:
+                executor.submit(publish_recording_progress, jid, True)
+        except Exception as e:
+            print(f"⚠️ [Progress Retry Error] {e}")
+
+threading.Thread(target=progress_retry_loop, daemon=True).start()
 
 def render_queue_summary(limit=10):
     with progress_lock:
@@ -1260,6 +1330,59 @@ def handle_event():
     return jsonify({"status": "ok", "latency": "instant"}), 200
 
 
+# ============ TELEGRAM MEDIA ANTI-FLOOD HELPERS ============
+def _parse_flood_wait_seconds(err_text, default=10):
+    text = str(err_text or "")
+    patterns = [r'FLOOD_WAIT_(\d+)', r'wait of (\d+) seconds', r'retry after (\d+)']
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                return max(1, int(m.group(1)))
+            except Exception:
+                pass
+    return default
+
+def _telegram_media_gate():
+    """Serialize media sends and keep a safe gap so Telegram/Pyrogram does not FLOOD_WAIT."""
+    global telegram_media_last_sent_at
+    with telegram_media_lock:
+        now = time.time()
+        wait = TELEGRAM_MEDIA_MIN_INTERVAL - (now - telegram_media_last_sent_at)
+        if wait > 0:
+            time.sleep(wait)
+        telegram_media_last_sent_at = time.time()
+
+def _send_pyrogram_media_safely(send_fn, label="media", retries=3):
+    for attempt in range(1, retries + 1):
+        try:
+            _telegram_media_gate()
+            send_fn()
+            return True
+        except Exception as e:
+            wait = _parse_flood_wait_seconds(e, default=8)
+            print(f"⚠️ [Telegram Media Flood] {label} attempt {attempt}/{retries}: waiting {wait}s ({e})")
+            time.sleep(wait + 1)
+    return False
+
+def _post_telegram_media_safely(url, files, data, timeout=180, label="media", retries=3):
+    for attempt in range(1, retries + 1):
+        _telegram_media_gate()
+        resp = requests.post(url, files=files, data=data, timeout=timeout)
+        if resp.status_code == 200:
+            return resp
+        if resp.status_code == 429:
+            retry_after = 10
+            try:
+                retry_after = int(resp.json().get("parameters", {}).get("retry_after", retry_after))
+            except Exception:
+                retry_after = _parse_flood_wait_seconds(resp.text, default=10)
+            print(f"⚠️ [Telegram Media Flood] {label} attempt {attempt}/{retries}: retry after {retry_after}s")
+            time.sleep(retry_after + 1)
+            continue
+        return resp
+    return resp
+
 # ============ TELEGRAM PLAYABLE VIDEO HELPERS ============
 def mp4_has_audio(file_path):
     """Return True if MP4 has at least one audio stream. Silent MP4s can appear as GIFs in Telegram."""
@@ -1381,21 +1504,36 @@ def send_telegram_file_smart(file_path, caption, is_video=False):
             if file_size <= max_chunk_size:
                 print(f"🚀 [Pyrogram Upload] Sending full {fmt_size(file_size)} file as single unit without split!")
                 if is_native_mp4:
-                    pyro_client.send_video(
-                        chat_id=CHANNEL_ID, video=file_path, caption=caption,
-                        supports_streaming=True, thumb=thumb_path,
-                        duration=video_meta.get('duration') or 0,
-                        width=video_meta.get('width') or 0,
-                        height=video_meta.get('height') or 0
+                    ok = _send_pyrogram_media_safely(
+                        lambda: pyro_client.send_video(
+                            chat_id=CHANNEL_ID, video=file_path, caption=caption,
+                            supports_streaming=True, thumb=thumb_path,
+                            duration=video_meta.get('duration') or 0,
+                            width=video_meta.get('width') or 0,
+                            height=video_meta.get('height') or 0
+                        ),
+                        label=f"video:{original_name}"
                     )
+                    if not ok:
+                        return False
                 else:
-                    pyro_client.send_document(chat_id=CHANNEL_ID, document=file_path, caption=caption)
+                    ok = _send_pyrogram_media_safely(
+                        lambda: pyro_client.send_document(chat_id=CHANNEL_ID, document=file_path, caption=caption),
+                        label=f"document:{original_name}"
+                    )
+                    if not ok:
+                        return False
             else:
                 send_telegram_message(f"📦 <b>MASSIVE FILE ({fmt_size(file_size)}) -> 2GB MTPROTO AUTO-SPLIT</b>\n📄 File: <code>{original_name}</code>\nSplitting into 1.9 GB pro-level parts...")
                 parts = split_large_file(file_path, max_size=max_chunk_size)
                 for i, part_path in enumerate(parts):
                     part_cap = f"📁 Part {i+1}/{len(parts)} (Pro 2GB Engine) of <code>{original_name}</code>\n{caption}"
-                    pyro_client.send_document(chat_id=CHANNEL_ID, document=part_path, caption=part_cap)
+                    ok = _send_pyrogram_media_safely(
+                        lambda p=part_path, c=part_cap: pyro_client.send_document(chat_id=CHANNEL_ID, document=p, caption=c),
+                        label=f"split:{os.path.basename(part_path)}"
+                    )
+                    if not ok:
+                        return False
                     try: os.remove(part_path)
                     except: pass
                 send_telegram_message(f"✅ Pro 2GB Backup complete for: <code>{original_name}</code> ({len(parts)} parts sent)")
@@ -1413,7 +1551,7 @@ def send_telegram_file_smart(file_path, caption, is_video=False):
                         if thumb_path and os.path.exists(thumb_path):
                             tf = open(thumb_path, 'rb')
                             files['thumbnail'] = ('thumb.jpg', tf, 'image/jpeg')
-                        resp = requests.post(
+                        resp = _post_telegram_media_safely(
                             f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
                             files=files,
                             data={
@@ -1423,7 +1561,8 @@ def send_telegram_file_smart(file_path, caption, is_video=False):
                                 "width": video_meta.get('width') or 0,
                                 "height": video_meta.get('height') or 0
                             },
-                            timeout=180
+                            timeout=180,
+                            label=f"video:{original_name}"
                         )
                         if resp.status_code != 200:
                             print(f"❌ Telegram sendVideo error: {resp.status_code} {resp.text[:300]}")
@@ -1436,11 +1575,12 @@ def send_telegram_file_smart(file_path, caption, is_video=False):
                         except Exception: pass
                 else:
                     with open(file_path, 'rb') as tf:
-                        resp = requests.post(
+                        resp = _post_telegram_media_safely(
                             f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
                             files={"document": (original_name, tf)},
                             data={"chat_id": CHANNEL_ID, "caption": caption, "parse_mode": "HTML"},
-                            timeout=120
+                            timeout=120,
+                            label=f"document:{original_name}"
                         )
                         if resp.status_code != 200:
                             print(f"❌ Telegram document error: {resp.status_code} {resp.text[:300]}")
@@ -1452,7 +1592,7 @@ def send_telegram_file_smart(file_path, caption, is_video=False):
                     part_cap = f"📁 Part {i+1}/{len(parts)} of <code>{original_name}</code>\n{caption}"
                     try:
                         with open(part_path, 'rb') as tf:
-                            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument", files={"document": (f"{original_name}.part{i+1}", tf)}, data={"chat_id": CHANNEL_ID, "caption": part_cap, "parse_mode": "HTML"}, timeout=180)
+                            _post_telegram_media_safely(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument", files={"document": (f"{original_name}.part{i+1}", tf)}, data={"chat_id": CHANNEL_ID, "caption": part_cap, "parse_mode": "HTML"}, timeout=180, label=f"split:{original_name}.part{i+1}")
                     except Exception as e: print(f"❌ Part upload error: {e}")
                     finally:
                         try: os.remove(part_path)
