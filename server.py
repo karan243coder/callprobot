@@ -1275,21 +1275,35 @@ def _merge_session_parts(key):
                 lf.write(f"file '{part_path}'\n")
 
         ffmpeg = media_converter.get_ffmpeg_path() if hasattr(media_converter, 'get_ffmpeg_path') else 'ffmpeg'
-        cmd_copy = [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', list_path, '-c', 'copy', '-movflags', '+faststart', final_tmp]
-        res = subprocess.run(cmd_copy, capture_output=True, text=True, timeout=max(300, len(sorted_parts) * 90))
-        if not (res.returncode == 0 and os.path.exists(final_tmp) and os.path.getsize(final_tmp) > 0):
-            print(f"⚠️ [Merge] Copy concat failed, transcoding fallback: {res.stderr[:300]}")
-            try:
-                if os.path.exists(final_tmp): os.remove(final_tmp)
-            except Exception:
-                pass
-            cmd_transcode = [
-                ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', list_path,
-                '-vf', 'scale=w=trunc(iw/2)*2:h=trunc(ih/2)*2,format=yuv420p',
-                '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', final_tmp
-            ]
-            res = subprocess.run(cmd_transcode, capture_output=True, text=True, timeout=max(600, len(sorted_parts) * 180))
+
+        # IMPORTANT: never stream-copy merged call chunks.
+        # Browser MediaRecorder chunks often carry odd time-bases / 30000 fps metadata.
+        # Stream-copy concat may "succeed" but create a fake 7+ minute duration for a short call.
+        # Always re-encode the final merged video to regenerate clean timestamps.
+        expected_duration = 0
+        try:
+            for _, part_path in sorted_parts:
+                meta = get_video_metadata(part_path)
+                dur = int(meta.get('duration') or 0)
+                if 0 < dur < 3600:
+                    expected_duration += dur
+        except Exception:
+            expected_duration = 0
+
+        cmd_transcode = [
+            ffmpeg, '-y',
+            '-fflags', '+genpts',
+            '-f', 'concat', '-safe', '0', '-i', list_path,
+            '-vf', 'fps=20,scale=w=trunc(iw/2)*2:h=trunc(ih/2)*2,format=yuv420p',
+            '-af', 'aresample=async=1:first_pts=0',
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart',
+            '-avoid_negative_ts', 'make_zero',
+            '-max_muxing_queue_size', '9999',
+            final_tmp
+        ]
+        res = subprocess.run(cmd_transcode, capture_output=True, text=True, timeout=max(600, len(sorted_parts) * 180))
 
         if not (res.returncode == 0 and os.path.exists(final_tmp) and os.path.getsize(final_tmp) > 0):
             update_recording_job(merge_job_id, "Merge failed — FFmpeg error", 100, "failed", error=(res.stderr[:500] if res else 'unknown'), force=True)
@@ -1300,6 +1314,13 @@ def _merge_session_parts(key):
             return
 
         os.replace(final_tmp, final_path)
+        try:
+            final_meta = get_video_metadata(final_path)
+            final_duration = int(final_meta.get('duration') or 0)
+            if expected_duration and final_duration > (expected_duration * 2 + 10):
+                print(f"⚠️ [Merge Duration Warning] expected ~{expected_duration}s but final metadata is {final_duration}s")
+        except Exception:
+            pass
         ensure_mp4_has_audio(final_path)
         final_size = os.path.getsize(final_path)
         update_recording_job(merge_job_id, "Uploading full merged MP4 to Telegram", 85, "uploading", output_size=fmt_size(final_size), force=True)
