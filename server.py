@@ -43,6 +43,7 @@ PROGRESS_CHAT_IDS_ENV = os.environ.get("PROGRESS_CHAT_IDS", "").strip()
 # Telegram anti-flood safety. Increase if channel has many parts/users.
 TELEGRAM_MEDIA_MIN_INTERVAL = float(os.environ.get("TELEGRAM_MEDIA_MIN_INTERVAL", "7"))
 PROGRESS_EDIT_INTERVAL_ENV = float(os.environ.get("PROGRESS_EDIT_INTERVAL", "20"))
+PROGRESS_FORCE_MIN_INTERVAL_ENV = float(os.environ.get("PROGRESS_FORCE_MIN_INTERVAL", "8"))
 telegram_media_lock = threading.Lock()
 telegram_media_last_sent_at = 0.0
 telegram_api_lock = threading.Lock()
@@ -82,6 +83,9 @@ recording_executor = ThreadPoolExecutor(max_workers=int(os.environ.get("RECORDIN
 
 # Dedicated merge worker: builds final full-call videos from already uploaded chunks.
 merge_executor = ThreadPoolExecutor(max_workers=int(os.environ.get("MERGE_WORKERS", "1")))
+
+# Dedicated progress worker: single-threaded to prevent duplicate progress messages and Telegram edit races.
+progress_executor = ThreadPoolExecutor(max_workers=int(os.environ.get("PROGRESS_WORKERS", "1")))
 
 active_rooms = {}
 
@@ -541,7 +545,8 @@ for _cid in [ADMIN_CHAT_ID] + [x.strip() for x in PROGRESS_CHAT_IDS_ENV.split(',
         progress_subscribers.add(str(_cid))
 
 MAX_PROGRESS_JOBS = 80
-PROGRESS_EDIT_INTERVAL = PROGRESS_EDIT_INTERVAL_ENV  # seconds; prevents Telegram flood/lag
+PROGRESS_EDIT_INTERVAL = PROGRESS_EDIT_INTERVAL_ENV  # normal progress edit gap
+PROGRESS_FORCE_MIN_INTERVAL = PROGRESS_FORCE_MIN_INTERVAL_ENV  # key-stage edit gap; terminal updates bypass this
 
 def _is_valid_progress_target(chat_id):
     return bool(chat_id and str(chat_id).strip() and str(chat_id).strip() not in ("@YOUR_CHANNEL_USERNAME", "YOUR_CHANNEL_USERNAME"))
@@ -675,7 +680,7 @@ def create_recording_job(room_id, seg_num, part_label, perspective, raw_size):
             old_ids = sorted(recording_jobs, key=lambda k: recording_jobs[k].get("created_at", 0))[:len(recording_jobs)-MAX_PROGRESS_JOBS]
             for oid in old_ids:
                 recording_jobs.pop(oid, None)
-    executor.submit(publish_recording_progress, job_id, True)
+    progress_executor.submit(publish_recording_progress, job_id, True)
     return job_id
 
 def update_recording_job(job_id, stage=None, progress=None, status=None, output_size=None, error=None, force=False):
@@ -697,11 +702,14 @@ def update_recording_job(job_id, stage=None, progress=None, status=None, output_
             job["error"] = str(error)[:500]
         job["updated_at"] = time.time()
         now = job["updated_at"]
-        if not force and now - job.get("last_edit_at", 0) < PROGRESS_EDIT_INTERVAL:
+        terminal_update = (status in ("done", "failed")) or (progress is not None and int(progress) >= 100)
+        min_gap = 0 if terminal_update else (PROGRESS_FORCE_MIN_INTERVAL if force else PROGRESS_EDIT_INTERVAL)
+        if now - job.get("last_edit_at", 0) < min_gap:
+            # Coalesce noisy stage updates. The retry loop will publish the latest state later.
             progress_retry_jobs.add(job_id)
             return
         job["last_edit_at"] = now
-    executor.submit(publish_recording_progress, job_id, force)
+    progress_executor.submit(publish_recording_progress, job_id, force)
 
 def publish_recording_progress(job_id, force=False):
     with progress_lock:
@@ -760,7 +768,7 @@ def progress_retry_loop():
                 retry_ids = list(progress_retry_jobs)[:20]
                 progress_retry_jobs.difference_update(retry_ids)
             for jid in retry_ids:
-                executor.submit(publish_recording_progress, jid, True)
+                progress_executor.submit(publish_recording_progress, jid, True)
         except Exception as e:
             print(f"⚠️ [Progress Retry Error] {e}")
 
