@@ -118,6 +118,40 @@ def init_db():
                 UNIQUE(user_id, friend_id)
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT UNIQUE NOT NULL,
+                sender TEXT NOT NULL,
+                receiver TEXT NOT NULL,
+                text TEXT NOT NULL,
+                mode TEXT DEFAULT '24h',
+                view_once INTEGER DEFAULT 0,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                delivered_at REAL DEFAULT 0,
+                read_at REAL DEFAULT 0,
+                viewed_at REAL DEFAULT 0,
+                deleted INTEGER DEFAULT 0
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(sender, receiver, created_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_expiry ON messages(expires_at, deleted)')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS call_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                caller TEXT NOT NULL,
+                receiver TEXT NOT NULL,
+                call_type TEXT DEFAULT 'video',
+                status TEXT DEFAULT 'missed',
+                duration TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                read_at REAL DEFAULT 0
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_call_logs_user ON call_logs(caller, receiver, created_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_call_logs_expiry ON call_logs(expires_at)')
         conn.commit()
         conn.close()
         print("📁 [SQLite Engine] meetlink.db connected & tables verified!")
@@ -130,6 +164,24 @@ def get_db_connection():
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+def _valid_username(u):
+    return bool(re.match(r'^[a-zA-Z0-9_]{3,20}$', (u or '').strip()))
+
+def _are_friends(cursor, a, b):
+    cursor.execute('''
+        SELECT 1 FROM friends f
+        JOIN users u1 ON f.user_id = u1.id
+        JOIN users u2 ON f.friend_id = u2.id
+        WHERE u1.username = ? AND u2.username = ? AND f.status = 'accepted'
+        LIMIT 1
+    ''', (a, b))
+    return cursor.fetchone() is not None
+
+def _cleanup_expired_messages(cursor):
+    now = time.time()
+    cursor.execute("DELETE FROM messages WHERE expires_at < ? OR deleted = 1", (now,))
+    cursor.execute("DELETE FROM call_logs WHERE expires_at < ?", (now,))
 
 @app.route('/api/auth/register', methods=['POST'])
 def auth_register():
@@ -431,6 +483,203 @@ def friends_remove():
     finally:
         conn.close()
 
+# ============ DISAPPEARING OFFLINE MESSAGES (TEXT ONLY, SERVER-SAFE) ============
+@app.route('/api/messages/send', methods=['POST'])
+def messages_send():
+    data = request.json or {}
+    sender = data.get('sender', '').strip().lower()
+    receiver = data.get('receiver', '').strip().lower()
+    text = (data.get('text') or '').strip()
+    message_id = (data.get('message_id') or data.get('id') or f"srv_{uuid.uuid4().hex[:14]}").strip()[:80]
+    mode = (data.get('mode') or '24h').strip().lower()
+
+    if not _valid_username(sender) or not _valid_username(receiver) or sender == receiver:
+        return jsonify({'error': 'Invalid sender/receiver'}), 400
+    if not text:
+        return jsonify({'error': 'Message text is required'}), 400
+    if len(text) > 1000:
+        return jsonify({'error': 'Message too long (max 1000 chars)'}), 400
+
+    view_once = 1 if mode in ('view_once', 'view-once', 'once', 'burn') else 0
+    ttl_seconds = 60 * 60 if mode in ('1h', 'hour', '1hour') else 24 * 60 * 60
+    now = time.time()
+    expires_at = now + ttl_seconds
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute('SELECT username FROM users WHERE username IN (?, ?)', (sender, receiver))
+        if len(cur.fetchall()) < 2:
+            return jsonify({'error': 'User not found'}), 404
+        if not (_are_friends(cur, sender, receiver) or _are_friends(cur, receiver, sender)):
+            return jsonify({'error': 'Users are not friends'}), 403
+        _cleanup_expired_messages(cur)
+        cur.execute('''
+            INSERT OR IGNORE INTO messages
+            (message_id, sender, receiver, text, mode, view_once, created_at, expires_at, delivered_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (message_id, sender, receiver, text, 'view_once' if view_once else mode, view_once, now, expires_at, now))
+        cur.execute('''
+            DELETE FROM messages WHERE id IN (
+                SELECT id FROM messages
+                WHERE ((sender=? AND receiver=?) OR (sender=? AND receiver=?))
+                ORDER BY created_at DESC LIMIT -1 OFFSET 80
+            )
+        ''', (sender, receiver, receiver, sender))
+        conn.commit()
+        return jsonify({'status': 'ok', 'message_id': message_id, 'expires_at': expires_at, 'view_once': bool(view_once)}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/messages/history', methods=['GET'])
+def messages_history():
+    user = request.args.get('user', '').strip().lower()
+    peer_name = request.args.get('peer', '').strip().lower()
+    try:
+        limit = min(100, max(1, int(request.args.get('limit', '50') or 50)))
+    except Exception:
+        limit = 50
+    if not _valid_username(user) or not _valid_username(peer_name):
+        return jsonify({'error': 'Invalid user/peer'}), 400
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        now = time.time()
+        _cleanup_expired_messages(cur)
+        cur.execute('''
+            SELECT id, message_id, sender, receiver, text, mode, view_once, created_at, expires_at, read_at, viewed_at
+            FROM messages
+            WHERE deleted = 0 AND expires_at > ?
+              AND ((sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?))
+            ORDER BY created_at DESC
+            LIMIT ?
+        ''', (now, user, peer_name, peer_name, user, limit))
+        rows = list(reversed(cur.fetchall()))
+        view_once_ids_to_delete = []
+        read_ids = []
+        result = []
+        for r in rows:
+            d = dict(r)
+            d['view_once'] = bool(d.get('view_once'))
+            d['is_own'] = d.get('sender') == user
+            result.append(d)
+            if d.get('receiver') == user:
+                read_ids.append(d.get('id'))
+                if d.get('view_once'):
+                    view_once_ids_to_delete.append(d.get('id'))
+        if read_ids:
+            q = ','.join('?' for _ in read_ids)
+            cur.execute(f"UPDATE messages SET read_at = CASE WHEN read_at=0 THEN ? ELSE read_at END WHERE id IN ({q})", [now] + read_ids)
+        if view_once_ids_to_delete:
+            q = ','.join('?' for _ in view_once_ids_to_delete)
+            cur.execute(f"UPDATE messages SET viewed_at=?, deleted=1, expires_at=? WHERE id IN ({q})", [now, now + 60] + view_once_ids_to_delete)
+        conn.commit()
+        return jsonify({'status': 'ok', 'messages': result}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/messages/read', methods=['POST'])
+def messages_read():
+    data = request.json or {}
+    user = data.get('user', '').strip().lower()
+    peer_name = data.get('peer', '').strip().lower()
+    if not _valid_username(user) or not _valid_username(peer_name):
+        return jsonify({'error': 'Invalid user/peer'}), 400
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        now = time.time()
+        cur.execute('''
+            UPDATE messages SET read_at = CASE WHEN read_at=0 THEN ? ELSE read_at END
+            WHERE receiver = ? AND sender = ? AND deleted = 0 AND expires_at > ?
+        ''', (now, user, peer_name, now))
+        conn.commit()
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/messages/unread-counts', methods=['GET'])
+def messages_unread_counts():
+    user = request.args.get('user', '').strip().lower()
+    if not _valid_username(user):
+        return jsonify({'error': 'Invalid user'}), 400
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        now = time.time()
+        _cleanup_expired_messages(cur)
+        cur.execute('''
+            SELECT sender, COUNT(*) AS c FROM messages
+            WHERE receiver = ? AND read_at = 0 AND deleted = 0 AND expires_at > ?
+            GROUP BY sender
+        ''', (user, now))
+        counts = {r['sender']: r['c'] for r in cur.fetchall()}
+        conn.commit()
+        return jsonify({'status': 'ok', 'counts': counts}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+# ============ LIGHTWEIGHT DISAPPEARING CALL LOGS ============
+@app.route('/api/calls/log', methods=['POST'])
+def calls_log():
+    data = request.json or {}
+    caller = data.get('caller', '').strip().lower()
+    receiver = data.get('receiver', '').strip().lower()
+    call_type = (data.get('call_type') or 'video').strip().lower()
+    status = (data.get('status') or 'missed').strip().lower()
+    duration = str(data.get('duration') or '')[:50]
+    if not _valid_username(caller) or not _valid_username(receiver) or caller == receiver:
+        return jsonify({'error': 'Invalid caller/receiver'}), 400
+    now = time.time()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute('''INSERT INTO call_logs (caller, receiver, call_type, status, duration, created_at, expires_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)''', (caller, receiver, call_type, status, duration, now, now + 24*60*60))
+        conn.commit()
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/calls/history', methods=['GET'])
+def calls_history():
+    user = request.args.get('user', '').strip().lower()
+    try:
+        limit = min(50, max(1, int(request.args.get('limit', '20') or 20)))
+    except Exception:
+        limit = 20
+    if not _valid_username(user):
+        return jsonify({'error': 'Invalid user'}), 400
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        now = time.time()
+        cur.execute('''
+            SELECT caller, receiver, call_type, status, duration, created_at
+            FROM call_logs
+            WHERE expires_at > ? AND (caller = ? OR receiver = ?)
+            ORDER BY created_at DESC LIMIT ?
+        ''', (now, user, user, limit))
+        return jsonify({'status': 'ok', 'calls': [dict(r) for r in cur.fetchall()]}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
 @app.route('/api/friends/list', methods=['GET'])
 def friends_list():
     username = request.args.get("username", "").strip().lower()
@@ -508,7 +757,17 @@ def background_ttl_cleaner():
                 active_rooms.pop(rid, None)
                 print(f"🧹 [TTL Cleaner] Auto-expired room: {rid}")
 
-            # 3. Clean orphaned disk files older than 1 hour (3600s) in upload & recording directories
+            # 3. Clean expired disappearing messages/call logs from SQLite
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                _cleanup_expired_messages(cur)
+                conn.commit()
+                conn.close()
+            except Exception as db_clean_err:
+                print(f"⚠️ [TTL Cleaner DB Error] {db_clean_err}")
+
+            # 4. Clean orphaned disk files older than 1 hour (3600s) in upload & recording directories
             for folder in [UPLOAD_DIR, RECORDING_DIR, MERGE_DIR]:
                 if os.path.exists(folder):
                     for fname in os.listdir(folder):
