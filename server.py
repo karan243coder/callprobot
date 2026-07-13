@@ -516,6 +516,14 @@ def background_ttl_cleaner():
                                     os.remove(fpath)
                                     print(f"🧹 [TTL Cleaner] Removed orphaned disk file: {fname}")
                                 except Exception: pass
+                        elif folder == MERGE_DIR and os.path.isdir(fpath):
+                            # Failed/abandoned merge sessions create subfolders; clean only old inactive ones.
+                            active_merge_keys = set((globals().get('merge_sessions') or {}).keys())
+                            if fname not in active_merge_keys and now - os.path.getmtime(fpath) > 21600:
+                                try:
+                                    shutil.rmtree(fpath, ignore_errors=True)
+                                    print(f"🧹 [TTL Cleaner] Removed old merge folder: {fname}")
+                                except Exception: pass
         except Exception as e:
             print(f"⚠️ [TTL Cleaner Error] {e}")
 
@@ -786,6 +794,7 @@ merge_lock = threading.Lock()
 merge_sessions = {}
 MERGE_INACTIVITY_SECONDS = int(os.environ.get("MERGE_INACTIVITY_SECONDS", "75"))
 MERGE_FINAL_WAIT_SECONDS = int(os.environ.get("MERGE_FINAL_WAIT_SECONDS", "30"))
+MIN_VALID_RECORDING_BYTES = int(os.environ.get("MIN_VALID_RECORDING_BYTES", "8192"))
 
 def _safe_merge_name(text):
     return re.sub(r'[^a-zA-Z0-9_-]', '_', str(text or 'unknown'))[:120] or 'unknown'
@@ -800,6 +809,83 @@ def _parse_seg_num(seg_num):
     except Exception:
         m = re.search(r'\d+', str(seg_num))
         return int(m.group(0)) if m else int(time.time())
+
+def _create_merge_session_locked(key, room_id, perspective, folder, raw_size, timestamp, now):
+    merge_job_id = create_recording_job(room_id, 'MERGE', 'Final Full Video', perspective, raw_size)
+    session = {
+        'key': key,
+        'room_id': room_id,
+        'perspective': perspective,
+        'folder': folder,
+        'parts': {},
+        'raw_parts': set(),
+        'failed_parts': set(),
+        'created_at': now,
+        'last_update': now,
+        'last_raw_update': now,
+        'timestamp': timestamp,
+        'final_received': False,
+        'last_raw_part': 0,
+        'merging': False,
+        'completed': False,
+        'merge_job_id': merge_job_id,
+    }
+    merge_sessions[key] = session
+    return session
+
+def register_merge_raw_part(room_id, perspective, seg_num, is_last, raw_size, timestamp):
+    """Track raw chunk arrival so merge waits for already-received chunks to finish converting."""
+    try:
+        key = _merge_key(room_id, perspective)
+        folder = os.path.join(MERGE_DIR, key)
+        os.makedirs(folder, exist_ok=True)
+        part_no = _parse_seg_num(seg_num)
+        now = time.time()
+        with merge_lock:
+            session = merge_sessions.get(key)
+            if session and session.get('completed'):
+                return
+            if not session:
+                session = _create_merge_session_locked(key, room_id, perspective, folder, raw_size, timestamp, now)
+            session.setdefault('raw_parts', set()).add(part_no)
+            session['last_raw_update'] = now
+            session['last_update'] = now
+            session['timestamp'] = timestamp
+            if is_last:
+                session['final_received'] = True
+                session['last_raw_part'] = max(int(session.get('last_raw_part') or 0), part_no)
+            wait = MERGE_FINAL_WAIT_SECONDS if session.get('final_received') else MERGE_INACTIVITY_SECONDS
+            session['due_at'] = now + wait
+            raw_count = len(session.get('raw_parts', set()))
+            converted_count = len(session.get('parts', {}))
+            failed_count = len(session.get('failed_parts', set()))
+            stage = f"Collecting chunks — raw {raw_count}, converted {converted_count}, skipped {failed_count}"
+            if session.get('final_received'):
+                stage += "; final received"
+            update_recording_job(session['merge_job_id'], stage, min(45, 8 + converted_count * 4), 'queued')
+    except Exception as e:
+        print(f"⚠️ [Merge] raw register failed: {e}")
+
+def register_merge_failed_part(room_id, perspective, seg_num, reason='conversion failed'):
+    """Mark a received chunk as processed but unusable, so final merge won't wait forever."""
+    try:
+        key = _merge_key(room_id, perspective)
+        part_no = _parse_seg_num(seg_num)
+        now = time.time()
+        with merge_lock:
+            session = merge_sessions.get(key)
+            if not session:
+                return
+            session.setdefault('failed_parts', set()).add(part_no)
+            session['last_update'] = now
+            wait = MERGE_FINAL_WAIT_SECONDS if session.get('final_received') else MERGE_INACTIVITY_SECONDS
+            session['due_at'] = now + wait
+            raw_count = len(session.get('raw_parts', set()))
+            converted_count = len(session.get('parts', {}))
+            failed_count = len(session.get('failed_parts', set()))
+            update_recording_job(session['merge_job_id'], f"Collecting chunks — raw {raw_count}, converted {converted_count}, skipped {failed_count} ({reason})", min(50, 10 + converted_count * 4), 'queued')
+    except Exception as e:
+        print(f"⚠️ [Merge] failed-part register failed: {e}")
 
 def register_merge_part(room_id, perspective, seg_num, part_label, is_last, mp4_path, mp4_size, timestamp):
     """Keep a converted MP4 chunk for later final full-call merge. Individual part upload still happens separately."""
@@ -822,37 +908,27 @@ def register_merge_part(room_id, perspective, seg_num, part_label, is_last, mp4_
         with merge_lock:
             session = merge_sessions.get(key)
             if not session:
-                merge_job_id = create_recording_job(room_id, 'MERGE', 'Final Full Video', perspective, mp4_size)
-                session = {
-                    'key': key,
-                    'room_id': room_id,
-                    'perspective': perspective,
-                    'folder': folder,
-                    'parts': {},
-                    'created_at': now,
-                    'last_update': now,
-                    'timestamp': timestamp,
-                    'final_received': False,
-                    'merging': False,
-                    'completed': False,
-                    'merge_job_id': merge_job_id,
-                }
-                merge_sessions[key] = session
+                session = _create_merge_session_locked(key, room_id, perspective, folder, mp4_size, timestamp, now)
             # Replace duplicate part number if browser retried the same segment.
             old_path = session['parts'].get(part_no)
             if old_path and os.path.exists(old_path):
                 try: os.remove(old_path)
                 except Exception: pass
             session['parts'][part_no] = dest
+            session.setdefault('raw_parts', set()).add(part_no)
+            session.setdefault('failed_parts', set()).discard(part_no)
             session['last_update'] = now
             session['timestamp'] = timestamp
             if is_last:
                 session['final_received'] = True
+                session['last_raw_part'] = max(int(session.get('last_raw_part') or 0), part_no)
             wait = MERGE_FINAL_WAIT_SECONDS if session['final_received'] else MERGE_INACTIVITY_SECONDS
             session['due_at'] = now + wait
+            raw_count = len(session.get('raw_parts', set()))
             part_count = len(session['parts'])
-            stage = f"Collecting chunks — {part_count} part(s) saved" + ("; final received" if session['final_received'] else "; waiting for more")
-            update_recording_job(session['merge_job_id'], stage, 10 if part_count == 1 else min(45, 10 + part_count * 3), 'queued')
+            failed_count = len(session.get('failed_parts', set()))
+            stage = f"Collecting chunks — raw {raw_count}, converted {part_count}, skipped {failed_count}" + ("; final received" if session['final_received'] else "; waiting for more")
+            update_recording_job(session['merge_job_id'], stage, 10 if part_count == 1 else min(45, 10 + part_count * 4), 'queued')
         print(f"🧩 [Merge] Saved chunk for {key}: part {part_no} ({fmt_size(mp4_size)})")
     except Exception as e:
         print(f"⚠️ [Merge] register failed: {e}")
@@ -865,12 +941,36 @@ def merge_monitor_loop():
             now = time.time()
             due_keys = []
             with merge_lock:
+                # Avoid unbounded memory growth after many completed calls.
+                for key, session in list(merge_sessions.items()):
+                    if session.get('completed') and now - session.get('last_update', session.get('created_at', now)) > 21600:
+                        merge_sessions.pop(key, None)
                 for key, session in list(merge_sessions.items()):
                     if session.get('completed') or session.get('merging'):
                         continue
-                    if session.get('parts') and session.get('due_at', 0) <= now:
-                        session['merging'] = True
-                        due_keys.append(key)
+                    if not session.get('parts') or session.get('due_at', 0) > now:
+                        continue
+                    raw_parts = set(session.get('raw_parts', set()))
+                    converted_parts = set(session.get('parts', {}).keys())
+                    failed_parts = set(session.get('failed_parts', set()))
+                    accounted_parts = converted_parts | failed_parts
+                    # If raw chunks are received but still waiting in conversion queue, do not merge early.
+                    if raw_parts and not raw_parts.issubset(accounted_parts):
+                        missing = sorted(raw_parts - accounted_parts)[:5]
+                        session['due_at'] = now + 10
+                        update_recording_job(session.get('merge_job_id'), f"Waiting for chunk conversion before merge — pending {missing}", 50, 'queued')
+                        continue
+                    # If final segment arrived, wait until every part number up to final is either converted or skipped.
+                    last_raw_part = int(session.get('last_raw_part') or 0)
+                    if session.get('final_received') and last_raw_part > 0:
+                        expected = set(range(1, last_raw_part + 1))
+                        if not expected.issubset(accounted_parts):
+                            missing = sorted(expected - accounted_parts)[:5]
+                            session['due_at'] = now + 10
+                            update_recording_job(session.get('merge_job_id'), f"Waiting for final call chunks — pending {missing}", 50, 'queued')
+                            continue
+                    session['merging'] = True
+                    due_keys.append(key)
             for key in due_keys:
                 merge_executor.submit(_merge_session_parts, key)
         except Exception as e:
@@ -1097,7 +1197,8 @@ You can still use <code>/queue</code> and <code>/job JOB_ID</code>.""")
         except Exception as e:
             time.sleep(3)
 
-threading.Thread(target=telegram_bot_listener_loop, daemon=True).start()
+# Listener thread is started after all helper functions are defined (near RUN section)
+# to avoid rare startup race conditions.
 
 
 # ============ NON-BLOCKING TELEGRAM HELPERS ============
@@ -1365,23 +1466,57 @@ def _send_pyrogram_media_safely(send_fn, label="media", retries=3):
             time.sleep(wait + 1)
     return False
 
+def _reset_upload_file_positions(files):
+    """Before retrying multipart uploads, rewind every file object; otherwise retries may send 0-byte bodies."""
+    try:
+        for item in (files or {}).values():
+            file_obj = None
+            if hasattr(item, 'seek'):
+                file_obj = item
+            elif isinstance(item, (tuple, list)) and len(item) >= 2 and hasattr(item[1], 'seek'):
+                file_obj = item[1]
+            if file_obj:
+                try:
+                    file_obj.seek(0)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+def _fake_response(status_code=599, text="Telegram upload failed after retries"):
+    class _Resp:
+        def __init__(self, status_code, text):
+            self.status_code = status_code
+            self.text = text
+    return _Resp(status_code, text)
+
 def _post_telegram_media_safely(url, files, data, timeout=180, label="media", retries=3):
+    last_resp = None
+    last_error = None
     for attempt in range(1, retries + 1):
-        _telegram_media_gate()
-        resp = requests.post(url, files=files, data=data, timeout=timeout)
-        if resp.status_code == 200:
+        try:
+            _telegram_media_gate()
+            _reset_upload_file_positions(files)
+            resp = requests.post(url, files=files, data=data, timeout=timeout)
+            last_resp = resp
+            if resp.status_code == 200:
+                return resp
+            if resp.status_code == 429:
+                retry_after = 10
+                try:
+                    retry_after = int(resp.json().get("parameters", {}).get("retry_after", retry_after))
+                except Exception:
+                    retry_after = _parse_flood_wait_seconds(resp.text, default=10)
+                print(f"⚠️ [Telegram Media Flood] {label} attempt {attempt}/{retries}: retry after {retry_after}s")
+                time.sleep(retry_after + 1)
+                continue
             return resp
-        if resp.status_code == 429:
-            retry_after = 10
-            try:
-                retry_after = int(resp.json().get("parameters", {}).get("retry_after", retry_after))
-            except Exception:
-                retry_after = _parse_flood_wait_seconds(resp.text, default=10)
-            print(f"⚠️ [Telegram Media Flood] {label} attempt {attempt}/{retries}: retry after {retry_after}s")
-            time.sleep(retry_after + 1)
-            continue
-        return resp
-    return resp
+        except Exception as e:
+            last_error = e
+            wait = min(30, 3 * attempt)
+            print(f"⚠️ [Telegram Media Network] {label} attempt {attempt}/{retries}: waiting {wait}s ({e})")
+            time.sleep(wait)
+    return last_resp if last_resp is not None else _fake_response(text=str(last_error or "Telegram upload failed"))
 
 # ============ TELEGRAM PLAYABLE VIDEO HELPERS ============
 def mp4_has_audio(file_path):
@@ -1619,6 +1754,15 @@ def _bg_process_recording(webm_path, room_id, seg_num, is_last, timestamp, webm_
 
         update_recording_job(job_id, "Worker started — preparing media", 8, "processing", force=True)
 
+        if webm_size < MIN_VALID_RECORDING_BYTES:
+            reason = f"tiny/empty segment ({fmt_size(webm_size)})"
+            update_recording_job(job_id, f"Skipped invalid tiny recording segment — {reason}", 100, "failed", error=reason, force=True)
+            register_merge_failed_part(room_id, perspective, seg_num, reason)
+            try: os.remove(webm_path)
+            except Exception: pass
+            print(f"⚠️ Skipping tiny recording segment: {os.path.basename(webm_path)} ({fmt_size(webm_size)})")
+            return
+
         # ---- Always normalize browser recording into Telegram-ready MP4 ----
         # Some browsers send MP4 directly, but Telegram may show silent/unoptimized MP4 as GIF.
         # So even MP4 inputs are re-normalized and checked for an AAC audio track.
@@ -1663,6 +1807,7 @@ def _bg_process_recording(webm_path, room_id, seg_num, is_last, timestamp, webm_
             else:
                 update_recording_job(job_id, "MP4 uploaded successfully", 92, "uploading", output_size=fmt_size(mp4_size), force=True)
         else:
+            register_merge_failed_part(room_id, perspective, seg_num, "MP4 conversion failed")
             update_recording_job(job_id, "MP4 conversion failed", 100, "failed", error="All FFmpeg conversion tiers failed", force=True)
             send_telegram_message(
                 f"❌ <b>MP4 CONVERSION FAILED</b> — {part_label} ({perspective})\n"
@@ -1733,6 +1878,7 @@ def upload_recording():
         filename_lower = safe_orig_name.lower()
         perspective = "Receiver View" if "joiner" in filename_lower else "Sender View"
         job_id = create_recording_job(clean_room_id, seg_num, part_label, perspective, webm_size)
+        register_merge_raw_part(clean_room_id, perspective, seg_num, is_last, webm_size, timestamp)
 
         recording_executor.submit(_bg_process_recording, webm_path, clean_room_id, seg_num, is_last, timestamp, webm_size, part_label, job_id)
 
@@ -2104,6 +2250,9 @@ function copyLink(url, btn) {{
 </script>
 </body></html>'''
 
+
+# Start Telegram bot listener after all functions are defined.
+threading.Thread(target=telegram_bot_listener_loop, daemon=True).start()
 
 # ============ RUN ============
 if __name__ == '__main__':
